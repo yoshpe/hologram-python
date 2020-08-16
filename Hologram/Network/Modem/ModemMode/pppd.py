@@ -12,7 +12,6 @@ import logging
 from logging import NullHandler
 import os
 import re
-import signal
 import time
 import threading
 import errno
@@ -60,6 +59,8 @@ class PPPConnection():
         self._commands.extend(args)
         self._commands.append('nodetach')
 
+    def __del__(self):
+        self._killProc()
 
     # EFFECTS: Spins out a new thread that connects to the network with a given
     #          timeout value. Default to DEFAULT_CONNECT_TIMEOUT seconds.
@@ -80,13 +81,25 @@ class PPPConnection():
         except Exception as e:
             self.logger.error(e)
 
-        if not result and self.proc and (self.proc.poll() is None):
-            self.logger.debug('Killing pppd')
-            self.proc.send_signal(signal.SIGTERM)
-            time.sleep(1)
+        if not result:
+            self._killProc()
 
         return result
 
+    def _killProc(self, timeout=10):
+        if self.proc and (self.proc.poll() is None):
+            self.logger.debug('Killing pppd')
+            self.proc.terminate()
+            start_time = time.time()
+            while True:
+                self.proc.poll()
+                if self.proc.returncode:
+                    # Empty pipes to avoid zombie processes
+                    self.proc.communicate()
+                    return self.proc.returncode
+                if start_time + timeout < time.time():
+                    self.logger.error('Wait on pppd timeout')
+                    return None
 
     def readFromPPP(self):
         try:
@@ -115,10 +128,7 @@ class PPPConnection():
 
     # EFFECTS: Disconnects from the network.
     def disconnect(self):
-        if self.proc and self.proc.poll() is None:
-            self.proc.send_signal(signal.SIGTERM)
-            time.sleep(1)
-
+        self._killProc()
 
     # EFFECTS: Returns true if a cellular connection is established.
     def connected(self):
