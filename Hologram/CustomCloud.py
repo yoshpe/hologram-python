@@ -12,6 +12,7 @@ import socket
 import sys
 import threading
 import time
+from select import select
 from Hologram.Cloud import Cloud
 from Exceptions.HologramError import HologramError
 
@@ -20,6 +21,29 @@ MAX_QUEUED_CONNECTIONS = 5
 RECEIVE_TIMEOUT = 5
 SEND_TIMEOUT = 5
 MIN_PERIODIC_INTERVAL = 1
+
+def recvall(s, timeout=None, encoding=None):
+    start_time = time.time()
+    s.setblocking(0)
+    timeleft = max(0, timeout or 1)
+    recv = b''
+    while True:
+        rlist, _, xlist = select([s], [], [s], min(1, timeleft))
+        if s in rlist:
+            result = s.recv(MAX_RECEIVE_BYTES)
+            if not result:
+                break
+            recv += result
+        if s in xlist:
+            break
+        if timeout is None:
+            continue
+        timeleft = timeout - (time.time() - start_time)
+        if timeleft <= 0:
+            break
+    if encoding:
+        recv = recv.decode(encoding)
+    return recv
 
 class CustomCloud(Cloud):
 
@@ -223,12 +247,11 @@ class CustomCloud(Cloud):
             self.network.open_receive_socket(self.receive_port)
             return True
 
-        self._receive_cv.acquire()
-        self._receive_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._receive_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.logger.info('Socket created')
-        self._receive_cv.release()
-
+        with self._receive_cv:
+            self._receive_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._receive_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.logger.info('Socket created')
+        
         self.open_receive_socket_helper()
 
         return True
@@ -236,32 +259,30 @@ class CustomCloud(Cloud):
     # EFFECTS: Opens and binds an inbound socket connection.
     def open_receive_socket_helper(self):
 
-        self._receive_cv.acquire()
-
-        # Try to bind to the socket if it's already initialized.
-        try:
-            self.logger.info('Binding to socket...')
-            self._receive_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._receive_socket.bind((self.receive_host, self.receive_port))
-        except socket.error:
-            self.logger.info('Retrying...')
+        with self._receive_cv:
+            # Try to bind to the socket if it's already initialized.
             try:
-                self._receive_socket.shutdown(socket.SHUT_RDWR)
+                self.logger.info('Binding to socket...')
+                self._receive_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self._receive_socket.bind((self.receive_host, self.receive_port))
             except socket.error:
-                pass
-            self._receive_socket.close()
-            self._receive_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._receive_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._receive_socket.bind((self.receive_host, self.receive_port))
+                self.logger.info('Retrying...')
+                try:
+                    self._receive_socket.shutdown(socket.SHUT_RDWR)
+                except socket.error:
+                    pass
+                self._receive_socket.close()
+                self._receive_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._receive_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self._receive_socket.bind((self.receive_host, self.receive_port))
 
-        # Set socketClose back to False since we're opening it again.
-        self.socketClose = False
-        self.sock = None
-        self._is_send_socket_open = False
+            # Set socketClose back to False since we're opening it again.
+            self.socketClose = False
+            self.sock = None
+            self._is_send_socket_open = False
 
-        # become a server socket
-        self._receive_socket.listen(MAX_QUEUED_CONNECTIONS)
-        self._receive_cv.release()
+            # become a server socket
+            self._receive_socket.listen(MAX_QUEUED_CONNECTIONS)
 
         # Spin a new thread for accepting incoming operations
         self._accept_thread = threading.Thread(target=self.acceptIncomingConnection)
@@ -277,76 +298,69 @@ class CustomCloud(Cloud):
             self.network.close_socket()
             return
 
-        self._receive_cv.acquire()
-
-        self.socketClose = True
-        self._receive_cv.release()
-
+        with self._receive_cv:
+            self.socketClose = True
+        
         self._accept_thread.join()
 
-        self._receive_cv.acquire()
-        try:
-            self._receive_socket.shutdown(socket.SHUT_RDWR)
-        except socket.error:
-            pass
-        self._receive_socket.close()
-
-        self._receive_cv.release()
+        with self._receive_cv:
+            try:
+                self._receive_socket.shutdown(socket.SHUT_RDWR)
+            except socket.error:
+                pass
+            self._receive_socket.close()
 
         self.logger.info('Socket closed.')
 
-
     def acceptIncomingConnection(self):
-        # This threaded infinite loop shoud keep listening on an incoming connection
-        while True:
-            self._receive_cv.acquire()
-
-            if self.socketClose:
-                self._receive_cv.release()
-                break
-
-            try:
-                self._receive_socket.setblocking(0)
-                (clientsocket, address) = self._receive_socket.accept()
-                self.logger.info('Connected to %s', address)
-                # Spin a new thread to handle the current incoming operation.
-                threading.Thread(target=self.__incoming_connection_thread,
-                                 args=[clientsocket]).start()
-            except:
-                pass
-
-            self._receive_cv.release()
+        try:
+            self._receive_socket.setblocking(0)
+            # This threaded infinite loop shoud keep listening on an incoming connection
+            while True:
+                with self._receive_cv:
+                    if self.socketClose:
+                        break
+                    # Use select to avoid a busy loop here
+                    rlist, _, xlist = select([self._receive_socket], [], [self._receive_socket], 1)
+                    if self._receive_socket in xlist:
+                        break
+                    if self._receive_socket not in rlist:
+                        continue
+                    (clientsocket, address) = self._receive_socket.accept()
+                    self.logger.info('Connected to %s', address)
+                    # Spin a new thread to handle the current incoming operation.
+                    threading.Thread(target=self.__incoming_connection_thread,
+                                    args=[clientsocket]).start()
+        except:
+            self.logger.exception("Exception in accept thread!")
 
     # EFFECTS: This threaded method accepts an inbound connection and appends
     #          the received message onto the receive buffer.
     #          It also broadcasts the message.received event
     def __incoming_connection_thread(self, clientsocket):
+        try:
+            # Keep parsing the received data until timeout or receive no more data.
+            # NOTE: the client doesn't close the socket so this always waits for timeout
+            recv = recvall(clientsocket, timeout=RECEIVE_TIMEOUT, encoding='utf-8')
+            if not recv:
+                self.logger.info("Received empty message!")
+                return
 
-        clientsocket.settimeout(RECEIVE_TIMEOUT)
+            self.logger.info('Received message: %s', recv)
 
-        # Keep parsing the received data until timeout or receive no more data.
-        recv = ''
-        while True:
+            with self._receive_buffer_lock:
+                # Append received message into receive buffer
+                self._receive_buffer.append(recv)
+                self.logger.debug('Receive buffer: %s', self._receive_buffer)
+
+            self.event.broadcast('message.received')
+        except:
+            self.logger.exception("Exception in incoming connection thread!")
+        finally:
             try:
-                result = clientsocket.recv(MAX_RECEIVE_BYTES)
-            except socket.timeout:
-                break
-            if not result:
-                break
-            recv += result
-
-        self.logger.info('Received message: %s', recv)
-
-        self._receive_buffer_lock.acquire()
-
-        # Append received message into receive buffer
-        self._receive_buffer.append(recv)
-        self.logger.debug('Receive buffer: %s', self._receive_buffer)
-
-        self._receive_buffer_lock.release()
-
-        self.event.broadcast('message.received')
-        clientsocket.close()
+                clientsocket.close()
+            except:
+                pass
 
     # EFFECTS: Returns the receive buffer and empties it.
     def popReceivedMessage(self):
@@ -354,14 +368,12 @@ class CustomCloud(Cloud):
         if self.__to_use_at_sockets():
             return self.network.pop_received_message()
 
-        self._receive_buffer_lock.acquire()
+        with self._receive_buffer_lock:
+            if len(self._receive_buffer) == 0:
+                data = None
+            else:
+                data = self._receive_buffer.popleft()
 
-        if len(self._receive_buffer) == 0:
-            data = None
-        else:
-            data = self._receive_buffer.popleft()
-
-        self._receive_buffer_lock.release()
         return data
 
     # EFFECTS: Makes sure that the send host and port are set before making
